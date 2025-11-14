@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 import io
 import json
 import time
@@ -5,19 +7,56 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import confusion_matrix
 
 from core.engine import MimicDefenseEngine
 from agents import SecurityAgent, default_security_tools
-from core.data_loader import load_kdd99, get_kdd_label_mappings
+from core.data_loader import (
+    load_kdd99,
+    get_kdd_label_mappings,
+    GenericCSVLoader,
+)
+
+# -------------------- 修复：所有数据集强制数值化 --------------------
+def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    统一预处理：将非数值列做 LabelEncoding，保留 label / attack_code。
+    输出纯数值 DataFrame，供 MimicDefenseEngine 使用。
+    """
+    df = df.copy()
+
+    protected_cols = {"label", "attack_code"}  # 不编码
+    encoders = {}
+
+    for col in df.columns:
+        if col in protected_cols:
+            continue
+        if df[col].dtype == object or str(df[col].dtype).startswith("category"):
+            le = LabelEncoder()
+            df[col] = df[col].astype(str)
+            df[col] = le.fit_transform(df[col])
+            encoders[col] = le
+
+        # boolean → int
+        if df[col].dtype == bool:
+            df[col] = df[col].astype(int)
+
+    # 确保 float32
+    for col in df.columns:
+        if col not in protected_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    return df
+
 
 # 中文修复
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-st.set_page_config(page_title="拟态防御·Fence-GAN电力AI内生安全系统", layout="wide")
+st.set_page_config(page_title="拟态防御·电力AI内生安全系统", layout="wide")
 
-st.title("⚡ 拟态防御 · Fence-GAN 内生安全防御系统（智能电网）")
+st.title("⚡ 拟态防御·内生安全防御系统（智能电网）")
 
 # ---------------- 状态初始化 ----------------
 if "engine" not in st.session_state:
@@ -31,23 +70,41 @@ if "logs" not in st.session_state:
 if "agent" not in st.session_state:
     st.session_state.agent = SecurityAgent(tools=default_security_tools)
 
-def log(msg):
+
+def log(msg: str):
     st.session_state.logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
 
 # ---------------- 侧边栏 ----------------
 with st.sidebar:
-    st.header("⚙️ 参数配置")
-    fg_epochs = st.slider("训练轮次", 1, 500, 10, 1)
-    fg_lr = st.select_slider("学习率", options=[1e-4, 2e-4, 5e-4, 1e-3], value=1e-3)
-    fg_latent = st.slider("隐变量维度", 4, 64, 32)
-    fg_boundary = st.slider("边界γ", 0.3, 0.9, 0.5, 0.05)
-    fg_dispersion = st.slider("分散λ", 0.0, 5.0, 1.0, 0.1)
-    fg_use_first_pct = st.slider("训练比例", 10, 90, 40, 5)
-    threshold = st.slider("检测阈值", 0.0, 1.0, 0.6, 0.01)
+    st.header("⚙️ 模式选择")
+
+    mode = st.radio("模型模式选择", ["训练新模型", "加载已有模型"])
+
+    model_path = st.text_input("模型保存/加载路径", "saved_models/model1")
+    st.divider()
+
+    # =============================== 训练参数 ===============================
+    if mode == "训练新模型":
+        st.subheader("🛠 训练参数")
+        fg_epochs = st.slider("训练轮次", 1, 500, 10, 1)
+        fg_lr = st.select_slider("学习率", options=[1e-4, 2e-4, 5e-4, 1e-3], value=1e-3)
+        fg_latent = st.slider("隐变量维度", 4, 64, 32)
+        fg_boundary = st.slider("边界 γ", 0.3, 0.9, 0.5, 0.05)
+        fg_dispersion = st.slider("分散 λ", 0.0, 5.0, 1.0, 0.1)
+        fg_use_first_pct = st.slider("训练比例（前多少%似为训练数据）", 10, 90, 40, 5)
+    else:
+        fg_epochs = fg_lr = fg_latent = fg_boundary = fg_dispersion = fg_use_first_pct = None
+        st.info("当前为『加载模型』模式，不需要训练参数。")
 
     st.divider()
-    use_demo = st.checkbox("使用演示数据（KDD99）", True)
-    f = st.file_uploader("上传CSV", type=["csv"])
+    threshold = st.slider("异常检测阈值", 0.0, 1.0, 0.6, 0.01)
+
+    st.divider()
+    dataset_mode = st.selectbox("数据来源", ["KDD99 演示数据", "上传 CSV（自动预处理）"])
+    file_obj = None
+    if dataset_mode == "上传 CSV（自动预处理）":
+        file_obj = st.file_uploader("上传 CSV 文件", type=["csv"])
 
     st.divider()
     btn_run = st.button("🚀 运行检测", use_container_width=True)
@@ -57,85 +114,109 @@ if btn_reset:
     st.session_state.engine = None
     st.session_state.last_result = None
     st.session_state.cached_figs.clear()
-    st.success("引擎已重置。")
+    st.session_state.logs.clear()
+    st.success("引擎与日志已重置。")
 
 # ---------------- 数据加载 ----------------
 def make_demo(n=1500, m=8):
     x = np.arange(n)
-    data = np.vstack([np.sin(x/30 + i) + np.random.randn(n)*0.1 for i in range(m)]).T
-    return pd.DataFrame(data, columns=[f"s{i+1}" for i in range(m)])
+    data = np.vstack(
+        [np.sin(x / 30 + i) + np.random.randn(n) * 0.1 for i in range(m)]
+    ).T
+    return pd.DataFrame(data, columns=[f"s{i + 1}" for i in range(m)])
+
 
 df = None
 attack_code_to_name = {}
-if f is not None:
-    df = pd.read_csv(f)
-elif use_demo:
+
+if dataset_mode == "KDD99 演示数据":
     try:
         df = load_kdd99()
         attack_code_to_name, _ = get_kdd_label_mappings()
-        st.info("使用 KDD99 演示数据")
-    except Exception:
+        st.info("使用 KDD99 演示数据，并自动完成特征编码与标准化。")
+    except Exception as e:
+        st.warning(f"KDD99 加载失败，使用随机模拟数据。错误：{e}")
         df = make_demo()
-        st.warning("KDD99 加载失败，使用随机数据。")
-else:
+
+else:  # CSV
+    if file_obj is None:
+        st.warning("请先上传 CSV 文件，再点击『运行检测』。")
+        st.stop()
+
+    try:
+        loader = GenericCSVLoader(file=file_obj)
+        df = loader.load()
+        st.success("已加载并预处理上传的 CSV 数据。")
+    except Exception as e:
+        st.error(f"CSV 解析失败：{e}")
+        st.stop()
+
+# ---------------- 数值化预处理（核心修复） ----------------
+if df is not None:
+    df = preprocess_dataframe(df)
+
+if df is None or df.empty:
+    st.error("数据为空，无法继续。")
     st.stop()
 
-# ---------------- 多标签页 ----------------
+# ---------------- Tabs ----------------
 tabs = st.tabs(["🎯 检测", "📊 对比分析", "📈 报告", "🧾 日志"])
 
 # ========== Tab1 检测 ==========
 with tabs[0]:
     if btn_run:
+        log("开始初始化 MimicDefenseEngine ...")
         st.session_state.engine = MimicDefenseEngine(
             nodes=[f"N{i}" for i in range(10)],
-            edges=[(f"N{i}", f"N{i+1}") for i in range(1,9)],
+            edges=[(f"N{i}", f"N{i + 1}") for i in range(1, 9)],
             fencegan_cfg=dict(
-                latent_dim=fg_latent, boundary_gamma=fg_boundary,
-                dispersion_lambda=fg_dispersion, lr=fg_lr,
-                epochs=fg_epochs, use_first_pct=fg_use_first_pct
-            )
+                latent_dim=fg_latent,
+                boundary_gamma=fg_boundary,
+                dispersion_lambda=fg_dispersion,
+                lr=fg_lr,
+                epochs=fg_epochs,
+                use_first_pct=fg_use_first_pct,
+            ),
         )
 
-        # 传入多任务训练所需的监督信号（若存在）
         binary_labels = df["label"].values if "label" in df.columns else None
         attack_codes = df["attack_code"].values if "attack_code" in df.columns else None
 
-        with st.spinner("Fence-GAN 正在训练与检测..."):
+        with st.spinner("正在训练与检测..."):
             result = st.session_state.engine.detect(
                 df,
                 context={
                     "threshold": threshold,
                     "binary_labels": binary_labels,
                     "attack_codes": attack_codes,
-                    "attack_code_to_name": attack_code_to_name
-                }
+                    "attack_code_to_name": attack_code_to_name,
+                },
             )
 
-        # ✅ 压缩存储结果（含多分类输出）
-        res = {k: v for k, v in result.items() if isinstance(v, (int, float, dict, list)) or v is None}
-        # ndarray -> list
-        for key in ["anomaly_prob", "window_prob", "type_classes", "type_class_names"]:
-            if key in result and result[key] is not None:
-                res[key] = result[key] if isinstance(result[key], list) else np.array(result[key]).tolist()
-        if result.get("type_pred_codes_ts") is not None:
-            res["type_pred_codes_ts"] = np.array(result["type_pred_codes_ts"]).tolist()
-        if result.get("type_prob_ts") is not None:
-            res["type_prob_ts"] = np.asarray(result["type_prob_ts"]).tolist()
-
+        # 压缩为可 JSON 化
+        res = {
+            k: (v.tolist() if isinstance(v, np.ndarray) else v)
+            for k, v in result.items()
+        }
         st.session_state.last_result = res
         st.session_state.cached_figs.clear()
+        log("检测完成。")
         st.success("检测完成！")
 
     if st.session_state.last_result:
         res = st.session_state.last_result
-        st.metric("平均异常概率", f"{np.mean(res['anomaly_prob']):.3f}")
-        fig, ax = plt.subplots(figsize=(8,3))
+        mean_anom = float(np.mean(res["anomaly_prob"]))
+        st.metric("平均异常概率", f"{mean_anom:.3f}")
+
+        fig, ax = plt.subplots(figsize=(8, 3))
         ax.plot(res["anomaly_prob"], label="异常概率")
         ax.axhline(threshold, linestyle="--", label="阈值")
+        ax.set_xlabel("时间步")
+        ax.set_ylabel("异常概率")
         ax.legend()
         st.pyplot(fig, clear_figure=True)
 
-# ========== Tab2 对比分析（仅 3 项） ==========
+# ========== Tab2 对比分析 ==========
 with tabs[1]:
     st.subheader("📊 实际 vs 预测（三项：混淆矩阵 / 异常概率曲线 / 标签预测准确图）")
     if st.session_state.last_result:
@@ -222,36 +303,8 @@ with tabs[1]:
 # ========== Tab3 报告 ==========
 with tabs[2]:
     if st.session_state.last_result:
-        res = st.session_state.last_result
         st.subheader("📈 Fence-GAN 检测报告")
-        with st.expander("查看完整 JSON 结果", expanded=False):
-            st.json(res)
-
-        def safe_convert(obj):
-            """递归地把 numpy 对象转成原生 Python 类型"""
-            import numpy as np
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, (np.generic,)):
-                return obj.item()
-            elif isinstance(obj, dict):
-                return {k: safe_convert(v) for k, v in obj.items()}
-            elif isinstance(obj, (list, tuple)):
-                return [safe_convert(v) for v in obj]
-            else:
-                return obj
-
-
-        res_jsonable = safe_convert(st.session_state.last_result)
-
-        st.download_button(
-            "下载检测结果",
-            json.dumps(res_jsonable, ensure_ascii=False, indent=2),
-            file_name="result.json",
-            mime="application/json"
-        )
-    else:
-        st.info("请先运行检测。")
+        st.json(st.session_state.last_result)
 
 # ========== Tab4 日志 ==========
 with tabs[3]:
